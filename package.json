@@ -1,0 +1,26 @@
+{
+  "name": "psbt-consolidator-cli",
+  "version": "1.0.0",
+  "description": "Generates a PSBT to consolidate UTXOs from a source address and target descriptors, distributing value evenly.",
+  "main": "cli.js",
+  "type": "module",
+  "scripts": {
+    "start": "node cli.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "bitcoin",
+    "psbt",
+    "consolidation",
+    "cli",
+    "bitcoin-core"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "decimal.js": "^10.4.3"
+  }
+}
