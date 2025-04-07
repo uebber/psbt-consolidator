@@ -67,7 +67,7 @@ The tool requires a JSON configuration file. Create a file (e.g., `config.json`)
      "estimatedWitnessVBytesPerInput": 28         // Default: 28 (suitable for P2WPKH). Adjust if needed.
   }
 }
-``
+```
 ## Attribution
 
 The initially uploaded version of this program has been generated with the amazing Gemini 2.5 Pro without any human modifications.
