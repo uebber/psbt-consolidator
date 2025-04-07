@@ -2,7 +2,7 @@
 
 A Node.js command-line tool to generate a Partially Signed Bitcoin Transaction (PSBT) for consolidating Bitcoin Core wallet UTXOs according to specific rules.
 
-Purpose: Minimize (future) fees by combining Bitcoin fund distribution and UXTO consolidation within a single transactions across sender and receiver wallets. I use it to automate a Bitcoin savings plan for my kids.
+Purpose: Minimize (future) fees by combining Bitcoin fund distribution and UXTO consolidation within a single transaction across sender and receiver wallets. I use it to automate a Bitcoin savings plan for my kids.
 
 ## Overview
 
