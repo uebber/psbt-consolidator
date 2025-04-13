@@ -4,24 +4,16 @@ import { createRawTx, decodeRawTx } from './bitcoinCoreUtils.js';
 import { satsToBtcString, ceilToBigInt } from './utils.js';
 import Decimal from 'decimal.js';
 
-// --- Configuration ---
-// Estimated vBytes added per input by witness data (signature + pubkey)
-// P2WPKH is typically ~108-110 weight units -> ceil(110 / 4) = 28 vBytes
-// P2TR uses Schnorr sigs, potentially slightly different, but 28 is a reasonable starting point.
-// Adjust if you consistently use different input types (e.g., larger multisig).
-const ESTIMATED_WITNESS_VBYTES_PER_INPUT = 28;
-// --- End Configuration ---
-
-
-// Calculates the optimal fee based on the specification
+// Calculates the optimal fee based on the specification, iterating to find minimum
 async function calculateOptimalFee(config, rpcClientConfig, inputs, derivedAddressesMap, totalInputValue /* BigInt */, feeRateSatPerVbyte /* Decimal */) {
     const numInputs = inputs.length;
+    const estimatedWitnessVBytesPerInput = config.feeOptions?.estimatedWitnessVBytesPerInput ?? 28; // Get from config or default
+
     logger.info(`Starting optimal fee calculation.`);
     logger.info(`  Inputs: ${numInputs}, Outputs: ${derivedAddressesMap.size}`);
     logger.info(`  Total Input Value: ${totalInputValue} sats`);
     logger.info(`  Target Feerate: ${feeRateSatPerVbyte.toFixed()} sat/vB`);
-    logger.info(`  Using estimated witness size: ${ESTIMATED_WITNESS_VBYTES_PER_INPUT} vBytes/input`);
-
+    logger.info(`  Using estimated witness size: ${estimatedWitnessVBytesPerInput} vBytes/input`);
 
     const numTargets = BigInt(derivedAddressesMap.size);
     if (numTargets === 0n) {
@@ -38,22 +30,20 @@ async function calculateOptimalFee(config, rpcClientConfig, inputs, derivedAddre
     let lastTotalEstimatedVBytes = 0;
     let lastSizeBasedFee = 0n;
     let lastRemainderSats = 0n;
+    let lastRequiredFee = 0n;
 
-    // --- Revised Fee Iteration Logic ---
-    // Start with a minimal fee guess (e.g., 1 sat or based on minimal size)
-    // Minimal size: ~11 base + 2*31 out + 5*41 non-witness-in = ~278 base, + 5*28 witness = ~140 witness => ~418 total. Fee ~418 sats @ 1 sat/vB
-    // Let's start guess slightly lower to ensure the loop works upwards correctly.
-    let currentFeeGuess = 1n; // Start with 1 satoshi
+    // Start with a minimal fee guess (1 satoshi)
+    let currentFeeGuess = 1n;
 
     const MAX_FEE_ITERATIONS = 20; // Safety break
-    for (let i = 0; i < MAX_FEE_ITERATIONS; i++) {
+    let i = 0;
+    for (i = 0; i < MAX_FEE_ITERATIONS; i++) {
         logger.debug(`Fee Iteration ${i + 1}: Trying Fee = ${currentFeeGuess} sats`);
 
         if (currentFeeGuess >= totalInputValue) {
-            logger.warn(`Fee guess (${currentFeeGuess}) exceeds total input value (${totalInputValue}). Cannot find valid fee.`);
-            // Set last calculated values for potential error message below
-             finalFee = -1n;
-             amountPerOutput = 0n;
+            logger.warn(`Fee guess (${currentFeeGuess}) meets or exceeds total input value (${totalInputValue}). Cannot find valid fee.`);
+            finalFee = -1n; // Mark as failed
+            amountPerOutput = 0n;
             break;
         }
 
@@ -62,15 +52,19 @@ async function calculateOptimalFee(config, rpcClientConfig, inputs, derivedAddre
         const currentAmountPerOutput = valueToDistribute / numTargets; // BigInt division floors automatically
 
         if (currentAmountPerOutput <= 0n) {
-            logger.debug(` Fee Iteration ${i + 1}: Fee ${currentFeeGuess} results in ${currentAmountPerOutput} amount per output. Fee is too high relative to input value.`);
-            // This fee is too high. We need to increase the fee guess minimally just in case
-            // the *previous* guess was only invalid due to remainder, but this usually means insufficient funds.
-            // If the loop started low, it should naturally increase. If it somehow jumped too high,
-            // this prevents getting stuck. A better approach might be needed if oscillations occur.
-            currentFeeGuess += 1n; // Increment and try again
-            finalFee = -1n; // Ensure failure state if loop exits here
-            amountPerOutput = 0n;
-            continue;
+            logger.debug(` Fee Iteration ${i + 1}: Fee ${currentFeeGuess} results in ${currentAmountPerOutput} amount per output. Fee is too high.`);
+             if(currentFeeGuess === lastRequiredFee && i > 0) {
+                 logger.error(`Fee calculation stuck: Fee ${currentFeeGuess} results in non-positive output amount.`);
+                 finalFee = -1n;
+                 amountPerOutput = 0n;
+                 break;
+             }
+             // This case usually means the required fee calculated previously already pushed it over the edge.
+             // Likely insufficient funds. Let the loop exit and throw error below.
+             logger.warn(`Fee ${currentFeeGuess} results in non-positive amount per output. Check total funds vs estimated minimum fee.`);
+             finalFee = -1n;
+             amountPerOutput = 0n;
+             break; // Exit loop, error handled after loop.
         }
 
         // Construct the outputs object for createrawtransaction
@@ -87,60 +81,51 @@ async function calculateOptimalFee(config, rpcClientConfig, inputs, derivedAddre
             lastCalculatedBaseVBytes = decodedTx.vsize; // Size without witness data
 
             // 2. Estimate Witness VBytes and Total VBytes
-            lastEstimatedWitnessVBytes = numInputs * ESTIMATED_WITNESS_VBYTES_PER_INPUT;
+            lastEstimatedWitnessVBytes = numInputs * estimatedWitnessVBytesPerInput;
             lastTotalEstimatedVBytes = lastCalculatedBaseVBytes + lastEstimatedWitnessVBytes;
             logger.debug(` Fee Iteration ${i + 1}: Base VBytes = ${lastCalculatedBaseVBytes}, Est. Witness VBytes = ${lastEstimatedWitnessVBytes}, Total Est. VBytes = ${lastTotalEstimatedVBytes}`);
-
 
             // 3. Calculate SizeBasedFee based on TOTAL estimated size
             const sizeBasedFeeDecimal = new Decimal(lastTotalEstimatedVBytes).mul(feeRateSatPerVbyte);
             lastSizeBasedFee = ceilToBigInt(sizeBasedFeeDecimal);
-            logger.debug(` Fee Iteration ${i + 1}: SizeBasedFee = ${lastSizeBasedFee} sats (from ${sizeBasedFeeDecimal.toFixed()} pre-ceil based on ${lastTotalEstimatedVBytes} vBytes)`);
+            logger.debug(` Fee Iteration ${i + 1}: SizeBasedFee = ${lastSizeBasedFee} sats (from ${sizeBasedFeeDecimal.toFixed()} based on ${lastTotalEstimatedVBytes} vBytes)`);
 
             // 4. Calculate RemainderSats = (TotalInputValue - currentFeeGuess) % NumTargets
             lastRemainderSats = valueToDistribute % numTargets;
             logger.debug(` Fee Iteration ${i + 1}: RemainderSats = ${lastRemainderSats} sats (for fee guess ${currentFeeGuess})`);
 
             // 5. Calculate the required fee for *this* iteration's size/remainder
-            const requiredFee = lastSizeBasedFee + lastRemainderSats;
-            logger.debug(` Fee Iteration ${i + 1}: Required Fee (SizeBasedFee + Remainder) = ${requiredFee} sats`);
+            lastRequiredFee = lastSizeBasedFee + lastRemainderSats; // Store for potential next guess
+            logger.debug(` Fee Iteration ${i + 1}: Required Fee (SizeBasedFee + Remainder) = ${lastRequiredFee} sats`);
 
-
-            // 6. Convergence Check:
-            if (currentFeeGuess === requiredFee) {
-                // Perfect match! This is our optimal fee.
-                logger.info(`Fee converged: currentFeeGuess (${currentFeeGuess}) == requiredFee (${requiredFee}). Optimal fee found.`);
+            // --- FIX: Simplified Convergence Check ---
+            if (currentFeeGuess >= lastRequiredFee) {
+                // Condition met: Fee >= SizeBasedFee + RemainderSats
+                // This currentFeeGuess is the lowest possible fee that satisfies the condition
+                // because we have increased the fee iteratively towards this point.
+                logger.info(`Fee condition met: currentFeeGuess (${currentFeeGuess}) >= requiredFee (${lastRequiredFee}). Optimal fee found.`);
                 finalFee = currentFeeGuess;
                 amountPerOutput = currentAmountPerOutput;
-                break; // Exit loop
-            } else if (currentFeeGuess > requiredFee) {
-                // Our guess is higher than needed for *this* size/remainder.
-                // This *could* be the minimum if decreasing the fee changes the remainder unfavorably.
-                // However, it's more likely the actual minimum is `requiredFee` or slightly higher.
-                // Let's try the `requiredFee` directly in the next iteration. If THAT requiredFee matches ITSELF, we are done.
-                 logger.debug(`Fee condition met (Guess ${currentFeeGuess} > Required ${requiredFee}), but potentially too high. Trying Required Fee next.`);
-                 // Store this as a *potential* answer in case the next iteration fails? Less complex: just set next guess.
-                 // finalFee = currentFeeGuess; // Tentative
-                 // amountPerOutput = currentAmountPerOutput; // Tentative
-                 currentFeeGuess = requiredFee; // Try the calculated required fee next iteration
+                break; // Exit loop, we found the minimum valid fee.
             }
-            else { // currentFeeGuess < requiredFee
+            else { // currentFeeGuess < lastRequiredFee
                 // Condition NOT met. The current fee guess is too low.
-                // The *minimum* fee we need to try next is `requiredFee`.
-                logger.debug(`Fee condition NOT met: currentFeeGuess (${currentFeeGuess}) < requiredFee (${requiredFee}). Increasing fee guess to required fee.`);
-                currentFeeGuess = requiredFee;
+                // The *minimum* fee we need to try next is `lastRequiredFee`.
+                logger.debug(`Fee condition NOT met: currentFeeGuess (${currentFeeGuess}) < requiredFee (${lastRequiredFee}). Increasing fee guess to required fee.`);
+                currentFeeGuess = lastRequiredFee;
                 // Loop will continue with this new, higher guess.
             }
+            // --- End of FIX ---
 
         } catch (error) {
             logger.error(`Error during fee calculation iteration ${i + 1} (Fee Guess: ${currentFeeGuess}): ${error.message}`);
             throw new Error(`Failed during fee calculation iteration: ${error.message}`);
         }
 
-        // Check if fee increased beyond total input value after adjustment
-        if (currentFeeGuess >= totalInputValue) {
-             logger.warn(`Next fee guess (${currentFeeGuess}) meets or exceeds total input value (${totalInputValue}). Stopping search.`);
-             finalFee = -1n; // Indicate failure
+        // Defensive check: Ensure fee doesn't become excessively large or negative accidentally
+        if (currentFeeGuess < 0n) {
+             logger.error(`Negative fee guess encountered (${currentFeeGuess}). Aborting calculation.`);
+             finalFee = -1n;
              amountPerOutput = 0n;
              break;
         }
@@ -148,32 +133,39 @@ async function calculateOptimalFee(config, rpcClientConfig, inputs, derivedAddre
     } // End of iteration loop
 
 
-    if (finalFee === -1n || amountPerOutput <= 0n) {
-        logger.error("Failed to find a valid fee and distribution after iterations.", {
+    // Error Handling after loop
+    if (finalFee <= 0n || amountPerOutput <= 0n) { // Check finalFee > 0 strictly
+        logger.error("Failed to find a valid positive fee and distribution after iterations.", {
             totalInputValue,
             numTargets,
-            lastFeeGuess: currentFeeGuess,
+            lastFeeGuess: currentFeeGuess, // Show the last guess attempted
             lastBaseVBytes: lastCalculatedBaseVBytes,
             lastEstWitnessVBytes: lastEstimatedWitnessVBytes,
             lastTotalEstVBytes: lastTotalEstimatedVBytes,
             lastSizeBasedFee,
-            lastRemainderSats
+            lastRemainderSats,
+            lastRequiredFee // Show the last calculated required fee
         });
-        if (lastTotalEstimatedVBytes > 0 && (lastSizeBasedFee + lastRemainderSats) >= totalInputValue) {
-             throw new Error(`Insufficient funds: Total input (${totalInputValue} sats) is less than the minimum required fee (${lastSizeBasedFee + lastRemainderSats} sats = size fee ${lastSizeBasedFee} + remainder ${lastRemainderSats}) calculated for Est. VBytes=${lastTotalEstimatedVBytes}.`);
-        } else if (currentFeeGuess >= totalInputValue) {
-             throw new Error(`Insufficient funds: Could not find a fee below the total input value (${totalInputValue} sats) that satisfies distribution requirements.`);
-        }
-         else if (i === MAX_FEE_ITERATIONS) {
-             throw new Error(`Failed to converge on an optimal fee within ${MAX_FEE_ITERATIONS} iterations. Check logs for details. Last guess: ${currentFeeGuess}. Last Required: ${lastSizeBasedFee + lastRemainderSats}.`);
-         }
-         else {
-            throw new Error("Failed to determine a valid fee/distribution. Possible insufficient funds or calculation error.");
+         if (lastTotalEstimatedVBytes > 0 && lastRequiredFee >= totalInputValue) {
+             throw new Error(`Insufficient funds: Total input (${totalInputValue} sats) is less than or equal to the minimum required fee (${lastRequiredFee} sats = size fee ${lastSizeBasedFee} + remainder ${lastRemainderSats}) calculated for Est. VBytes=${lastTotalEstimatedVBytes}.`);
+         } else if (currentFeeGuess >= totalInputValue) {
+              throw new Error(`Insufficient funds: Final fee guess (${currentFeeGuess} sats) reached or exceeded total input value (${totalInputValue} sats) during search.`);
+         } else if (i >= MAX_FEE_ITERATIONS) { // Use >= to catch exact max iteration case
+             throw new Error(`Failed to converge on an optimal fee within ${MAX_FEE_ITERATIONS} iterations. Check logs for details (oscillation likely). Last Guess: ${currentFeeGuess}, Last Required Fee: ${lastRequiredFee}.`);
+         } else {
+            // General error if loop exited unexpectedly (e.g., non-positive amount)
+            throw new Error(`Failed to determine a valid fee/distribution. Last guess: ${currentFeeGuess}. Possible insufficient funds or calculation error.`);
         }
     }
 
     // --- Final Summary Logging ---
-    const finalCalculatedFee = lastSizeBasedFee + lastRemainderSats; // Fee based on the *final* iteration's size/remainder
+    // Recalculate required fee components based *exactly* on the chosen finalFee for accurate reporting
+    const finalValueToDistribute = totalInputValue - finalFee;
+    const finalRemainder = finalValueToDistribute % numTargets;
+    // Size component can be inferred: finalFee - finalRemainder
+    const finalSizeFeeComponent = finalFee - finalRemainder;
+
+
     logger.info(`Optimal Fee Calculation Complete:`);
     logger.info(`  Final Fee: ${finalFee} sats`);
     logger.info(`  Amount Per Output: ${amountPerOutput} sats`);
@@ -181,11 +173,10 @@ async function calculateOptimalFee(config, rpcClientConfig, inputs, derivedAddre
     logger.info(`  Total Output Value: ${amountPerOutput * numTargets} sats`);
     logger.info(`  Total Spent (Outputs + Fee): ${amountPerOutput * numTargets + finalFee} sats`);
     logger.info(`  Total Input Value: ${totalInputValue} sats`);
-    logger.info(`  Fee Breakdown (based on final state):`);
-    logger.info(`    Size Fee Component: ${lastSizeBasedFee} sats (for ~${lastTotalEstimatedVBytes} vBytes @ ${feeRateSatPerVbyte.toFixed(2)} sat/vB)`);
-    logger.info(`    Remainder Fee Comp: ${lastRemainderSats} sats (to absorb distribution remainder)`);
-    // Note: finalFee might be slightly different from lastSizeBasedFee + lastRemainderSats if the last step involved `currentFeeGuess > requiredFee`
-    // logger.info(`    (Check: Size + Remainder = ${finalCalculatedFee})`);
+    logger.info(`  Fee Breakdown (derived from final fee):`);
+    // Display the size fee component calculated in the final relevant iteration for context
+    logger.info(`    Size Fee Component (Est): ${finalSizeFeeComponent} sats (Targeting ~${lastSizeBasedFee} sats for ~${lastTotalEstimatedVBytes} vBytes)`);
+    logger.info(`    Remainder Fee Comp:     ${finalRemainder} sats (Absorbed remainder)`);
     logger.info(`  Transaction Est. VBytes: ${lastTotalEstimatedVBytes} (Base: ${lastCalculatedBaseVBytes}, Witness: ${lastEstimatedWitnessVBytes})`);
 
 
