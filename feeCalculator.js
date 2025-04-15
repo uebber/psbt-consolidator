@@ -36,15 +36,16 @@ async function calculateOptimalFee(config, rpcClientConfig, inputs, derivedAddre
     let currentFeeGuess = 1n;
 
     const MAX_FEE_ITERATIONS = 20; // Safety break
-    let i = 0;
-    for (i = 0; i < MAX_FEE_ITERATIONS; i++) {
+    let i; // <<<< FIX: Declare loop counter 'i' outside the loop scope
+
+    for (i = 0; i < MAX_FEE_ITERATIONS; i++) { // Initialize i here
         logger.debug(`Fee Iteration ${i + 1}: Trying Fee = ${currentFeeGuess} sats`);
 
         if (currentFeeGuess >= totalInputValue) {
             logger.warn(`Fee guess (${currentFeeGuess}) meets or exceeds total input value (${totalInputValue}). Cannot find valid fee.`);
             finalFee = -1n; // Mark as failed
             amountPerOutput = 0n;
-            break;
+            break; // Exit loop
         }
 
         // Calculate potential AmountPerOutput based on this fee guess
@@ -53,14 +54,13 @@ async function calculateOptimalFee(config, rpcClientConfig, inputs, derivedAddre
 
         if (currentAmountPerOutput <= 0n) {
             logger.debug(` Fee Iteration ${i + 1}: Fee ${currentFeeGuess} results in ${currentAmountPerOutput} amount per output. Fee is too high.`);
-             if(currentFeeGuess === lastRequiredFee && i > 0) {
+             if(currentFeeGuess === lastRequiredFee && i > 0) { // Check i > 0 to avoid check on first iteration
                  logger.error(`Fee calculation stuck: Fee ${currentFeeGuess} results in non-positive output amount.`);
                  finalFee = -1n;
                  amountPerOutput = 0n;
                  break;
              }
              // This case usually means the required fee calculated previously already pushed it over the edge.
-             // Likely insufficient funds. Let the loop exit and throw error below.
              logger.warn(`Fee ${currentFeeGuess} results in non-positive amount per output. Check total funds vs estimated minimum fee.`);
              finalFee = -1n;
              amountPerOutput = 0n;
@@ -98,27 +98,23 @@ async function calculateOptimalFee(config, rpcClientConfig, inputs, derivedAddre
             lastRequiredFee = lastSizeBasedFee + lastRemainderSats; // Store for potential next guess
             logger.debug(` Fee Iteration ${i + 1}: Required Fee (SizeBasedFee + Remainder) = ${lastRequiredFee} sats`);
 
-            // --- FIX: Simplified Convergence Check ---
+            // Convergence Check (Previous Fix Applied)
             if (currentFeeGuess >= lastRequiredFee) {
-                // Condition met: Fee >= SizeBasedFee + RemainderSats
-                // This currentFeeGuess is the lowest possible fee that satisfies the condition
-                // because we have increased the fee iteratively towards this point.
                 logger.info(`Fee condition met: currentFeeGuess (${currentFeeGuess}) >= requiredFee (${lastRequiredFee}). Optimal fee found.`);
                 finalFee = currentFeeGuess;
                 amountPerOutput = currentAmountPerOutput;
                 break; // Exit loop, we found the minimum valid fee.
             }
             else { // currentFeeGuess < lastRequiredFee
-                // Condition NOT met. The current fee guess is too low.
-                // The *minimum* fee we need to try next is `lastRequiredFee`.
                 logger.debug(`Fee condition NOT met: currentFeeGuess (${currentFeeGuess}) < requiredFee (${lastRequiredFee}). Increasing fee guess to required fee.`);
                 currentFeeGuess = lastRequiredFee;
                 // Loop will continue with this new, higher guess.
             }
-            // --- End of FIX ---
 
         } catch (error) {
             logger.error(`Error during fee calculation iteration ${i + 1} (Fee Guess: ${currentFeeGuess}): ${error.message}`);
+            // Add stack trace for debug level
+            logger.debug(error.stack);
             throw new Error(`Failed during fee calculation iteration: ${error.message}`);
         }
 
@@ -134,6 +130,7 @@ async function calculateOptimalFee(config, rpcClientConfig, inputs, derivedAddre
 
 
     // Error Handling after loop
+    // Now 'i' is accessible here
     if (finalFee <= 0n || amountPerOutput <= 0n) { // Check finalFee > 0 strictly
         logger.error("Failed to find a valid positive fee and distribution after iterations.", {
             totalInputValue,
@@ -150,7 +147,7 @@ async function calculateOptimalFee(config, rpcClientConfig, inputs, derivedAddre
              throw new Error(`Insufficient funds: Total input (${totalInputValue} sats) is less than or equal to the minimum required fee (${lastRequiredFee} sats = size fee ${lastSizeBasedFee} + remainder ${lastRemainderSats}) calculated for Est. VBytes=${lastTotalEstimatedVBytes}.`);
          } else if (currentFeeGuess >= totalInputValue) {
               throw new Error(`Insufficient funds: Final fee guess (${currentFeeGuess} sats) reached or exceeded total input value (${totalInputValue} sats) during search.`);
-         } else if (i >= MAX_FEE_ITERATIONS) { // Use >= to catch exact max iteration case
+         } else if (i >= MAX_FEE_ITERATIONS) { // <<<< FIX: Use 'i' declared outside loop
              throw new Error(`Failed to converge on an optimal fee within ${MAX_FEE_ITERATIONS} iterations. Check logs for details (oscillation likely). Last Guess: ${currentFeeGuess}, Last Required Fee: ${lastRequiredFee}.`);
          } else {
             // General error if loop exited unexpectedly (e.g., non-positive amount)
@@ -159,10 +156,8 @@ async function calculateOptimalFee(config, rpcClientConfig, inputs, derivedAddre
     }
 
     // --- Final Summary Logging ---
-    // Recalculate required fee components based *exactly* on the chosen finalFee for accurate reporting
     const finalValueToDistribute = totalInputValue - finalFee;
     const finalRemainder = finalValueToDistribute % numTargets;
-    // Size component can be inferred: finalFee - finalRemainder
     const finalSizeFeeComponent = finalFee - finalRemainder;
 
 
@@ -174,7 +169,6 @@ async function calculateOptimalFee(config, rpcClientConfig, inputs, derivedAddre
     logger.info(`  Total Spent (Outputs + Fee): ${amountPerOutput * numTargets + finalFee} sats`);
     logger.info(`  Total Input Value: ${totalInputValue} sats`);
     logger.info(`  Fee Breakdown (derived from final fee):`);
-    // Display the size fee component calculated in the final relevant iteration for context
     logger.info(`    Size Fee Component (Est): ${finalSizeFeeComponent} sats (Targeting ~${lastSizeBasedFee} sats for ~${lastTotalEstimatedVBytes} vBytes)`);
     logger.info(`    Remainder Fee Comp:     ${finalRemainder} sats (Absorbed remainder)`);
     logger.info(`  Transaction Est. VBytes: ${lastTotalEstimatedVBytes} (Base: ${lastCalculatedBaseVBytes}, Witness: ${lastEstimatedWitnessVBytes})`);
